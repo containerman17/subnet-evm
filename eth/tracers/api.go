@@ -102,6 +102,15 @@ type Backend interface {
 	StateAtTransaction(ctx context.Context, block *types.Block, txIndex int, reexec uint64) (*core.Message, vm.BlockContext, *state.StateDB, StateReleaseFunc, error)
 }
 
+// SlimArchiveProvider provides access to stored trace data from the slim archive.
+type SlimArchiveProvider interface {
+	// GetTrace returns the stored trace for a transaction.
+	// tracer specifies which trace type: "callTracer" (default) or "prestateTracer".
+	GetTrace(hash common.Hash, tracer string) ([]byte, error)
+	// HasTrace checks if a trace exists for the given transaction.
+	HasTrace(hash common.Hash) bool
+}
+
 // baseAPI holds the collection of common methods for API and FileTracerAPI.
 type baseAPI struct {
 	backend Backend
@@ -110,11 +119,17 @@ type baseAPI struct {
 // API is the collection of tracing APIs exposed over the private debugging endpoint.
 type API struct {
 	baseAPI
+	slimArchive SlimArchiveProvider
 }
 
 // NewAPI creates a new API definition for the tracing methods of the Ethereum service.
 func NewAPI(backend Backend) *API {
-	return &API{baseAPI{backend: backend}}
+	return &API{baseAPI: baseAPI{backend: backend}}
+}
+
+// SetSlimArchive sets the slim archive provider for serving historical traces.
+func (api *API) SetSlimArchive(provider SlimArchiveProvider) {
+	api.slimArchive = provider
 }
 
 // FileTracerAPI is the collection of additional tracing APIs exposed over the private
@@ -876,6 +891,23 @@ func containsTx(block *types.Block, hash common.Hash) bool {
 // TraceTransaction returns the structured logs created during the execution of EVM
 // and returns them as a JSON object.
 func (api *API) TraceTransaction(ctx context.Context, hash common.Hash, config *TraceConfig) (interface{}, error) {
+	// If slim archive is enabled, use it exclusively - all accepted blocks should be indexed
+	if api.slimArchive != nil {
+		tracer := ""
+		if config != nil && config.Tracer != nil {
+			tracer = *config.Tracer
+		}
+		data, err := api.slimArchive.GetTrace(hash, tracer)
+		if err != nil {
+			return nil, fmt.Errorf("trace not found in slim archive (tx may be pending or node is still syncing): %w", err)
+		}
+		var result interface{}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal trace from slim archive: %w", err)
+		}
+		return result, nil
+	}
+
 	found, _, blockHash, blockNumber, index, err := api.backend.GetTransaction(ctx, hash)
 	if err != nil {
 		return nil, ethapi.NewTxIndexingError()
@@ -1056,11 +1088,19 @@ func (api *baseAPI) traceTx(ctx context.Context, message *core.Message, txctx *C
 
 // APIs return the collection of RPC services the tracer package offers.
 func APIs(backend Backend) []rpc.API {
-	// Append all the local APIs and return
-	return []rpc.API{
+	api, apis := APIsWithTracer(backend)
+	_ = api // API is returned for optional configuration
+	return apis
+}
+
+// APIsWithTracer returns the tracer API instance along with the RPC services.
+// This allows the caller to configure the API (e.g., set a slim archive provider).
+func APIsWithTracer(backend Backend) (*API, []rpc.API) {
+	api := NewAPI(backend)
+	return api, []rpc.API{
 		{
 			Namespace: "debug",
-			Service:   NewAPI(backend),
+			Service:   api,
 			Name:      "debug-tracer",
 		},
 		{

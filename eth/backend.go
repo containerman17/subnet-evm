@@ -115,6 +115,9 @@ type Ethereum struct {
 	stackRPCs []rpc.API
 
 	settings Settings // Settings for Ethereum API
+
+	// tracerAPI is stored to allow setting the slim archive provider
+	tracerAPI *tracers.API
 }
 
 // roundUpCacheSize returns [input] rounded up to the next multiple of [allocSize]

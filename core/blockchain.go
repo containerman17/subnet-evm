@@ -287,6 +287,13 @@ type txLookup struct {
 	transaction *types.Transaction
 }
 
+// BlockHook is an interface for receiving block data after execution
+// but before state is committed. This is used by the slim archive feature
+// to capture traces while state is still available.
+type BlockHook interface {
+	OnBlockProcessed(block *types.Block, receipts types.Receipts, statedb *state.StateDB) error
+}
+
 // BlockChain represents the canonical chain given a database with a genesis
 // block. The Blockchain manages chain imports, reverts, chain reorganisations.
 //
@@ -345,6 +352,7 @@ type BlockChain struct {
 	validator Validator // Block and state validator interface
 	processor Processor // Block transaction processor interface
 	vmConfig  vm.Config
+	blockHook BlockHook // Optional hook called after block execution
 
 	lastAccepted *types.Block // Prevents reorgs past this height
 
@@ -1446,6 +1454,13 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 	blockValidationTimer.Inc((vtime - (triehash + trieUpdate)).Milliseconds()) // The time spent on block validation
 	blockTrieOpsTimer.Inc((triehash + trieUpdate + trieRead).Milliseconds())   // The time spent on trie operations
 
+	// Call block hook if set (used by slim archive to capture traces)
+	if bc.blockHook != nil {
+		if err := bc.blockHook.OnBlockProcessed(block, receipts, statedb); err != nil {
+			log.Error("Block hook failed", "block", block.NumberU64(), "err", err)
+		}
+	}
+
 	// If [writes] are disabled, skip [writeBlockWithState] so that we do not write the block
 	// or the state trie to disk.
 	// Note: in pruning mode, this prevents us from generating a reference to the state root.
@@ -2226,6 +2241,12 @@ func (bc *BlockChain) ResetToStateSyncedBlock(block *types.Block) error {
 // during block building.
 func (bc *BlockChain) CacheConfig() *CacheConfig {
 	return bc.cacheConfig
+}
+
+// SetBlockHook sets a hook that will be called after each block is processed
+// but before state is committed. This is used by slim archive to capture traces.
+func (bc *BlockChain) SetBlockHook(hook BlockHook) {
+	bc.blockHook = hook
 }
 
 func (bc *BlockChain) repairTxIndexTail(newTail uint64) error {

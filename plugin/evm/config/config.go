@@ -21,6 +21,13 @@ type (
 	}
 )
 
+// SlimArchiveConfig configures the slim archive feature which stores
+// trace data in a separate PebbleDB for historical trace queries.
+type SlimArchiveConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"`
+}
+
 // Config ...
 type Config struct {
 	// Airdrop
@@ -187,6 +194,9 @@ type Config struct {
 
 	// Database Scheme
 	StateScheme string `json:"state-scheme"`
+
+	// Slim Archive Settings
+	SlimArchive SlimArchiveConfig `json:"slim-archive"`
 }
 
 // GetConfig returns a new config object with the default values set and the
@@ -258,6 +268,17 @@ func (c *Config) validate(_ uint32) error {
 	if c.PushGossipPercentStake < 0 || c.PushGossipPercentStake > 1 {
 		return fmt.Errorf("push-gossip-percent-stake is %f but must be in the range [0, 1]", c.PushGossipPercentStake)
 	}
+
+	// Slim archive requires specific configuration to ensure all blocks are indexed
+	if c.SlimArchive.Enabled {
+		if !c.Pruning {
+			return errors.New("slim-archive requires pruning-enabled=true (archive mode stores full trie which defeats the purpose)")
+		}
+		if c.StateSyncEnabled {
+			return errors.New("slim-archive requires state-sync-enabled=false (must sync from genesis to index all blocks)")
+		}
+	}
+
 	return nil
 }
 

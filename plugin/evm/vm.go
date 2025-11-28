@@ -72,6 +72,7 @@ import (
 	"github.com/ava-labs/subnet-evm/plugin/evm/extension"
 	"github.com/ava-labs/subnet-evm/plugin/evm/gossip"
 	"github.com/ava-labs/subnet-evm/plugin/evm/message"
+	"github.com/ava-labs/subnet-evm/plugin/evm/slimarchive"
 	"github.com/ava-labs/subnet-evm/precompile/precompileconfig"
 	"github.com/ava-labs/subnet-evm/rpc"
 	"github.com/ava-labs/subnet-evm/sync/client/stats"
@@ -255,6 +256,9 @@ type VM struct {
 	// Used to serve BLS signatures of warp messages over RPC
 	warpBackend warp.Backend
 
+	// Slim archive for storing historical trace data
+	slimArchive *slimarchive.Indexer
+
 	// Initialize only sets these if nil so they can be overridden in tests
 	ethTxGossipHandler p2p.Handler
 	ethTxPushGossiper  avalancheUtils.Atomic[*avalanchegossip.PushGossiper[*GossipEthTx]]
@@ -328,6 +332,12 @@ func (vm *VM) Initialize(
 	// Initialize the database
 	if err := vm.initializeDBs(db); err != nil {
 		return fmt.Errorf("failed to initialize databases: %w", err)
+	}
+
+	// Check slim archive consistency before proceeding
+	// This must be done early to prevent starting with inconsistent state
+	if err := vm.checkSlimArchiveConsistency(); err != nil {
+		return fmt.Errorf("slim archive consistency check failed: %w", err)
 	}
 
 	if vm.config.InspectDatabase {
@@ -644,8 +654,83 @@ func (vm *VM) initializeChain(lastAcceptedHash common.Hash, ethConfig ethconfig.
 	vm.txPool.SetMinFee(feeConfig.MinBaseFee)
 	vm.txPool.SetGasTip(big.NewInt(0))
 
+	// Initialize slim archive if enabled
+	if vm.config.SlimArchive.Enabled {
+		if err := vm.initSlimArchive(); err != nil {
+			return fmt.Errorf("failed to initialize slim archive: %w", err)
+		}
+	}
+
 	vm.eth.Start()
 	return vm.initChainState(lastAccepted)
+}
+
+// initSlimArchive initializes the slim archive store and indexer.
+func (vm *VM) initSlimArchive() error {
+	path := vm.config.SlimArchive.Path
+	if path == "" {
+		// Default to a subdirectory of the chain data
+		path = filepath.Join(vm.config.DatabasePath, "slimarchive")
+	}
+
+	log.Info("Initializing slim archive", "path", path)
+
+	store, err := slimarchive.NewStore(path)
+	if err != nil {
+		return fmt.Errorf("failed to open slim archive store: %w", err)
+	}
+
+	// Mark as enabled (idempotent) - this prevents future disabling
+	if err := store.MarkEnabled(); err != nil {
+		store.Close()
+		return fmt.Errorf("failed to mark slim archive as enabled: %w", err)
+	}
+
+	// Create indexer and set up block hook
+	vm.slimArchive = slimarchive.NewIndexer(store, vm.chainConfig, vm.blockChain)
+	vm.blockChain.SetBlockHook(vm.slimArchive)
+
+	// Check last indexed block
+	head, err := store.GetHead()
+	if err == nil {
+		log.Info("Slim archive initialized", "lastIndexedBlock", head)
+	} else {
+		log.Info("Slim archive initialized", "lastIndexedBlock", "none")
+	}
+
+	return nil
+}
+
+// checkSlimArchiveConsistency verifies slim archive config is consistent with history.
+// - If slim archive was ever enabled, it cannot be disabled (would lose trace history)
+// - If slim archive was ever disabled after being enabled, it cannot be re-enabled (incomplete history)
+func (vm *VM) checkSlimArchiveConsistency() error {
+	path := vm.config.SlimArchive.Path
+	if path == "" {
+		path = filepath.Join(vm.config.DatabasePath, "slimarchive")
+	}
+
+	wasEnabled, exists, err := slimarchive.WasEverEnabled(path)
+	if err != nil {
+		return fmt.Errorf("failed to check slim archive state: %w", err)
+	}
+
+	if vm.config.SlimArchive.Enabled {
+		// Enabling slim archive
+		if exists && !wasEnabled {
+			// DB exists but wasn't marked as enabled - this means it was disabled after being used
+			// We cannot re-enable because we'd have incomplete history
+			return errors.New("cannot enable slim archive: database exists but was previously disabled, trace history is incomplete")
+		}
+	} else {
+		// Slim archive disabled in config
+		if wasEnabled {
+			// Was previously enabled - cannot disable
+			return errors.New("cannot disable slim archive: it was previously enabled and contains trace history, disabling would cause data inconsistency")
+		}
+	}
+
+	return nil
 }
 
 // initializeStateSyncClient initializes the client for performing state sync.
@@ -992,6 +1077,12 @@ func (vm *VM) Shutdown(context.Context) error {
 	for _, handler := range vm.rpcHandlers {
 		handler.Stop()
 	}
+	// Close slim archive before closing main database
+	if vm.slimArchive != nil {
+		if err := vm.slimArchive.Close(); err != nil {
+			log.Error("failed to close slim archive", "err", err)
+		}
+	}
 	vm.eth.Stop()
 	log.Info("Ethereum backend stop completed")
 	if vm.usingStandaloneDB {
@@ -1215,6 +1306,17 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 			return nil, err
 		}
 		enabledAPIs = append(enabledAPIs, "warp")
+	}
+
+	// Register slim archive APIs if enabled
+	if vm.slimArchive != nil {
+		archiveAPIs := slimarchive.APIs(vm.slimArchive.Store())
+		for _, api := range archiveAPIs {
+			if err := handler.RegisterName(api.Namespace, api.Service); err != nil {
+				return nil, fmt.Errorf("failed to register slim archive API: %w", err)
+			}
+		}
+		enabledAPIs = append(enabledAPIs, "slimarchive")
 	}
 
 	log.Info("enabling apis",
